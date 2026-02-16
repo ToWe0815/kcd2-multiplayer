@@ -1,7 +1,7 @@
 <kcd_mod>
     <info>
         <name>KCD2 Multiplayer</name>
-        <modid>kcd_multiplayer</modid>
+        <modid>kdcmp</modid>
         <description>Multiplayer sync mod</description>
         <author>Your</author>
         <version>0.3</version>
