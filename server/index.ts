@@ -63,23 +63,33 @@ async function evalLua(expr: string): Promise<string> {
   return getCvar("sv_servername");
 }
 
-// ===== Player Position via REST API =====
+// ===== Player Position + Rotation =====
 
 async function readPlayerFromAPI(): Promise<PlayerState | null> {
   try {
+    // Read position from REST API
     const xml = await fetchAPI("/api/rpg/SoulList/PlayerSoul?depth=1");
-
     const posMatch = xml.match(/Position="([^"]+)"/);
     if (!posMatch) return null;
 
     const parts = posMatch[1].split(",");
     if (parts.length < 3) return null;
 
+    // Read rotation via Lua (player:GetWorldAngles().z)
+    let rotZ = 0;
+    try {
+      const rotStr = await evalLua("player:GetWorldAngles().z");
+      const parsed = parseFloat(rotStr);
+      if (!isNaN(parsed)) rotZ = parsed;
+    } catch {
+      // rotation read failed, use 0
+    }
+
     return {
       x: parseFloat(parts[0]),
       y: parseFloat(parts[1]),
       z: parseFloat(parts[2]),
-      rotZ: 0,
+      rotZ,
       timestamp: Date.now(),
     };
   } catch {
@@ -94,31 +104,28 @@ async function updateGhost(playerPos: PlayerState) {
   const gx = (playerPos.x + 3).toFixed(2);
   const gy = playerPos.y.toFixed(2);
   const gz = playerPos.z.toFixed(2);
+  const rot = playerPos.rotZ.toFixed(4);
 
   if (modLoaded) {
-    // Use mod's ghost management functions
     try {
       await execLua(
-        `KCD2MP_UpdateGhost("test_ghost",${gx},${gy},${gz})`
+        `KCD2MP_UpdateGhost("test_ghost",${gx},${gy},${gz},${rot})`
       );
       if (!ghostSpawned) {
-        console.log(`[server] Ghost update sent via mod: ${gx}, ${gy}, ${gz}`);
+        console.log(`[server] Ghost spawned via mod: ${gx}, ${gy}, ${gz}`);
         ghostSpawned = true;
       }
     } catch {
       // silent
     }
   } else {
-    // Fallback: direct spawn without mod
     try {
       const lua = ghostSpawned
-        ? `local e=System.GetEntityByName("mp_ghost"); if e then e:SetWorldPos({x=${gx},y=${gy},z=${gz}}) end`
+        ? `local e=System.GetEntityByName("mp_ghost"); if e then e:SetWorldPos({x=${gx},y=${gy},z=${gz}}); e:SetWorldAngles({x=0,y=0,z=${rot}}) end`
         : `local e=System.SpawnEntity({class="NPC",name="mp_ghost",position={x=${gx},y=${gy},z=${gz}}}); if e then KCD2MP_GhostId=e.id end`;
       await execLua(lua);
       if (!ghostSpawned) {
-        console.log(
-          `[server] Ghost spawn sent (no mod): ${gx}, ${gy}, ${gz}`
-        );
+        console.log(`[server] Ghost spawned (no mod): ${gx}, ${gy}, ${gz}`);
         ghostSpawned = true;
       }
     } catch {
@@ -167,12 +174,13 @@ async function probeAPI(): Promise<boolean> {
 
 // ===== Main Loop =====
 
-function posChanged(a: PlayerState | null, b: PlayerState): boolean {
+function stateChanged(a: PlayerState | null, b: PlayerState): boolean {
   if (!a) return true;
   return (
     Math.abs(a.x - b.x) > 0.05 ||
     Math.abs(a.y - b.y) > 0.05 ||
-    Math.abs(a.z - b.z) > 0.05
+    Math.abs(a.z - b.z) > 0.05 ||
+    Math.abs(a.rotZ - b.rotZ) > 0.02
   );
 }
 
@@ -194,10 +202,10 @@ async function tick() {
 
   try {
     const pos = await readPlayerFromAPI();
-    if (pos && posChanged(localPlayer, pos)) {
+    if (pos && stateChanged(localPlayer, pos)) {
       localPlayer = pos;
       console.log(
-        `[player] x=${pos.x.toFixed(1)} y=${pos.y.toFixed(1)} z=${pos.z.toFixed(1)}`
+        `[player] x=${pos.x.toFixed(1)} y=${pos.y.toFixed(1)} z=${pos.z.toFixed(1)} rot=${pos.rotZ.toFixed(2)}`
       );
 
       await updateGhost(pos);

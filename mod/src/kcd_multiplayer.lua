@@ -92,15 +92,19 @@ function KCD2MP_SpawnGhost(id, x, y, z)
 end
 
 
-function KCD2MP_UpdateGhost(id, x, y, z)
+function KCD2MP_UpdateGhost(id, x, y, z, rotZ)
     local ghost = KCD2MP.ghosts[id]
     if not ghost or not ghost.entity then
         KCD2MP_SpawnGhost(id, x, y, z)
-        return
+        ghost = KCD2MP.ghosts[id]
+        if not ghost then return end
     end
 
     local ok, err = pcall(function()
         ghost.entity:SetWorldPos({x=x, y=y, z=z})
+        if rotZ then
+            ghost.entity:SetWorldAngles({x=0, y=0, z=rotZ})
+        end
     end)
     if not ok then
         System.LogAlways("[KCD2-MP] SetWorldPos error: " .. tostring(err))
