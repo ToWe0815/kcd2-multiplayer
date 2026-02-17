@@ -183,3 +183,7 @@ netsh advfirewall firewall delete rule name="KCD2 API 1404"
 - Position sync only - movement, rotation
 - Both players must be in a loaded save for sync to work
 - Server must be restarted if a player reloads their save
+
+## Dev mod
+
+modify the kdcmp files and create pak files with the https://github.com/7H3LaughingMan/KCD2-PAK
