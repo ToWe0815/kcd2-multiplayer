@@ -258,9 +258,20 @@ function KCD2MP_InterpTick()
             istate.cz = z
             istate.cr = r
 
+            -- Terrain snap: prevent ghost from going underground
+            -- Terrain.GetElevation(x, y) returns terrain Z at horizontal position (x, y)
+            local sz = z
+            pcall(function()
+                local gz = Terrain.GetElevation(x, y)
+                if gz and sz < gz then
+                    sz = gz
+                    istate.cz = gz  -- update lerp source so next frame continues from snapped z
+                end
+            end)
+
             -- Apply to entity
             local ok, err = pcall(function()
-                ghost.entity:SetWorldPos({x=x, y=y, z=z})
+                ghost.entity:SetWorldPos({x=x, y=y, z=sz})
                 ghost.entity:SetWorldAngles({x=0, y=0, z=r})
             end)
             if not ok then
@@ -851,6 +862,32 @@ function KCD2MP_TestRunAnim()
     System.LogAlways("[KCD2-MP] === END ===")
 end
 
+-- ===== Terrain Debug =====
+
+function KCD2MP_TerrainCheck()
+    if not player then System.LogAlways("[KCD2-MP] TerrainCheck: no player"); return end
+    local pos = player:GetWorldPos()
+    if not pos then return end
+
+    local ok, gz = pcall(function() return Terrain.GetElevation(pos.x, pos.y) end)
+    System.LogAlways(string.format("[KCD2-MP] TerrainCheck: player pos=%.2f,%.2f,%.2f | Terrain.GetElevation=ok=%s gz=%s",
+        pos.x, pos.y, pos.z, tostring(ok), tostring(gz)))
+
+    -- Check ghost position vs terrain
+    for id, ghost in pairs(KCD2MP.ghosts) do
+        if ghost.entity then
+            local gpos = nil
+            pcall(function() gpos = ghost.entity:GetWorldPos() end)
+            local tgz = nil
+            if gpos then
+                pcall(function() tgz = Terrain.GetElevation(gpos.x, gpos.y) end)
+                System.LogAlways(string.format("[KCD2-MP] Ghost '%s': entity z=%.2f | terrain z=%s | diff=%s",
+                    id, gpos.z, tostring(tgz), tgz and string.format("%.2f", gpos.z - tgz) or "?"))
+            end
+        end
+    end
+end
+
 -- ===== Register Console Commands =====
 
 local ok, err = pcall(function()
@@ -868,6 +905,7 @@ local ok, err = pcall(function()
     System.AddCCommand("mp_read_adb",     "KCD2MP_ReadADB()",       "Read kcd_male_database.adb via CryEngine XML loader")
     System.AddCCommand("mp_probe_tags",   "KCD2MP_ProbeAnimTags()", "Probe Mannequin animation tags on ghost")
     System.AddCCommand("mp_test_run",     "KCD2MP_TestRunAnim()",   "Test 3d_relaxed_run_turn_strafe on ghost")
+    System.AddCCommand("mp_terrain",      "KCD2MP_TerrainCheck()",  "Check player/ghost vs terrain height")
     System.LogAlways("[KCD2-MP] Commands OK")
 end)
 if not ok then
