@@ -102,6 +102,9 @@ function KCD2MP_SpawnGhost(id, x, y, z, rotZ)
         ticksSincePacket = 0,
         -- Packet arrival count (for logging)
         packetCount = 0,
+        -- Animation state
+        animState = "none",   -- "none", "idle", "run"
+        animTimer = 0,        -- ticks since last StartAnimation call
     }
 
     local hasChar = false
@@ -116,6 +119,10 @@ function KCD2MP_SpawnGhost(id, x, y, z, rotZ)
             })
         end)
     end
+
+    -- Try to disable AI so it doesn't fight our animation calls
+    pcall(function() entity:SetAIEnabled(false) end)
+    pcall(function() entity:EnableAI(false) end)
 
     KCD2MP.ghosts[id] = {
         entity = entity,
@@ -256,6 +263,37 @@ function KCD2MP_InterpTick()
             if not ok then
                 System.LogAlways("[KCD2-MP] InterpTick err on '" .. id .. "': " .. tostring(err))
                 ghost.entity = nil
+            else
+                -- === Animation ===
+                -- Speed from velocity (horizontal only, ignore vertical)
+                local speed = math.sqrt(istate.vx * istate.vx + istate.vy * istate.vy)
+                local isMoving = speed > 0.3
+                -- Real Mannequin animation names from kcd_male_database.adb:
+                --   [run]  -> 3d_relaxed_run_turn_strafe
+                --   [walk] -> 3d_relaxed_walk_turn_strafe
+                --   []     -> relaxed_idle_both  (Mannequin idle)
+                local wantAnim = isMoving and "3d_relaxed_run_turn_strafe" or "relaxed_idle_both"
+
+                istate.animTimer = (istate.animTimer or 0) + 1
+                if wantAnim ~= istate.animState or istate.animTimer >= 20 then
+                    istate.animState = wantAnim
+                    istate.animTimer = 0
+                    pcall(function()
+                        ghost.entity:StartAnimation(0, wantAnim)
+                    end)
+                    -- Also drive via AI tag system
+                    if isMoving then
+                        pcall(function() AI.SetAnimationTag(ghost.entityId, "run") end)
+                        pcall(function() AI.SetForcedNavigation(ghost.entityId,
+                            {x=istate.vx/speed, y=istate.vy/speed, z=0}) end)
+                        pcall(function() AI.SetSpeed(ghost.entityId, speed) end)
+                    else
+                        pcall(function() AI.SetAnimationTag(ghost.entityId, "") end)
+                        pcall(function() AI.SetForcedNavigation(ghost.entityId, {x=0,y=0,z=0}) end)
+                        pcall(function() AI.SetSpeed(ghost.entityId, 0) end)
+                    end
+                end
+                istate.isMoving = isMoving
             end
         end
     end
@@ -424,6 +462,393 @@ function KCD2MP_FindNPCs()
     System.LogAlways("[KCD2-MP] === END ===")
 end
 
+-- ===== Animation Discovery =====
+
+-- Probe animation names - only GetAnimationLength > 0 is reliable
+function KCD2MP_ProbeAnims()
+    local ghost = nil
+    for _, g in pairs(KCD2MP.ghosts) do ghost = g; break end
+    if not ghost or not ghost.entity then
+        System.LogAlways("[KCD2-MP] ProbeAnims: no ghost.")
+        return
+    end
+    local ent = ghost.entity
+
+    -- Full CryEngine path variants (no extension) + short names
+    local candidates = {
+        -- Short names
+        "idle", "run", "walk", "sprint", "jog",
+        "Idle", "Run", "Walk", "Sprint",
+        -- Full path guesses (KCD2 convention)
+        "animations/humans/male/locomotion/run_loop",
+        "animations/humans/male/locomotion/walk_loop",
+        "animations/humans/male/locomotion/idle_loop",
+        "animations/humans/male/locomotion/run_fwd",
+        "animations/humans/male/locomotion/walk_fwd",
+        "animations/humans/male/locomotion/sprint_loop",
+        "animations/humans/male/locomotion/run",
+        "animations/humans/male/locomotion/walk",
+        "animations/humans/male/locomotion/idle",
+        -- KCD1-style paths
+        "animations/characters/humans/male/locomotion/run_loop",
+        "animations/characters/humans/male/locomotion/walk_loop",
+        "animations/characters/humans/male/locomotion/idle_loop",
+        -- Assets subfolder
+        "animations/assets/humans/locomotion/run_loop",
+        "animations/assets/humans/locomotion/walk_loop",
+        -- Mannequin fragment names
+        "MotionIdle", "MotionRun", "MotionWalk",
+        "LocomotionIdle", "LocomotionRun", "LocomotionWalk",
+        "Locomotion", "locomotion",
+    }
+
+    System.LogAlways("[KCD2-MP] === PROBING ANIMS ON GHOST ===")
+    for _, name in ipairs(candidates) do
+        local len = 0
+        pcall(function() len = ent:GetAnimationLength(0, name) or 0 end)
+        if len > 0 then
+            System.LogAlways(string.format("[KCD2-MP] HIT: '%s' len=%.3f", name, len))
+        end
+    end
+    System.LogAlways("[KCD2-MP] === END ===")
+end
+
+-- Find nearby HUMAN NPC and get their character model path, then copy to ghost
+function KCD2MP_CopyNPCModel()
+    if not player then return end
+    local ppos = player:GetWorldPos()
+    System.LogAlways("[KCD2-MP] === FIND HUMAN NPC + COPY MODEL ===")
+
+    local ghost = nil
+    for _, g in pairs(KCD2MP.ghosts) do ghost = g; break end
+    if not ghost or not ghost.entity then
+        System.LogAlways("[KCD2-MP] No ghost entity! Run server first.")
+        return
+    end
+
+    local ok, err = pcall(function()
+        local ents = System.GetEntitiesInSphere(ppos, 50)
+        if not ents then return end
+
+        local humanCount = 0
+        for _, ent in ipairs(ents) do
+            if ent ~= player then
+                -- Must have soul or human (real human NPC, not horse/door/chest)
+                local isHuman = false
+                pcall(function()
+                    isHuman = (ent.soul ~= nil) or (ent.human ~= nil)
+                end)
+                if not isHuman then
+                    -- Also accept NPCs with actor table
+                    pcall(function()
+                        if ent.actor and ent.actor.__this then isHuman = true end
+                    end)
+                end
+
+                if isHuman then
+                    local ename = "?"
+                    pcall(function() ename = ent:GetName() end)
+                    local eclass = "?"
+                    pcall(function() eclass = ent.class or "?" end)
+                    System.LogAlways(string.format("[KCD2-MP] HUMAN NPC: %s (class=%s)", ename, eclass))
+                    humanCount = humanCount + 1
+
+                    -- Try to get character filename
+                    local cdfPath = nil
+                    pcall(function()
+                        local ch = ent:GetCharacter(0)
+                        if ch then
+                            cdfPath = ch:GetFilePath()
+                            System.LogAlways("[KCD2-MP]   GetCharacter(0):GetFilePath() = " .. tostring(cdfPath))
+                        end
+                    end)
+                    pcall(function()
+                        local fn = ent:GetCharacterFileName(0)
+                        System.LogAlways("[KCD2-MP]   GetCharacterFileName(0) = " .. tostring(fn))
+                        if fn and not cdfPath then cdfPath = fn end
+                    end)
+                    -- Check Properties for model path
+                    pcall(function()
+                        if ent.Properties then
+                            for k, v in pairs(ent.Properties) do
+                                if type(v) == "string" and #v > 3 then
+                                    if k:lower():find("model") or k:lower():find("cdf") or
+                                       k:lower():find("file") or k:lower():find("char") then
+                                        System.LogAlways("[KCD2-MP]   Props." .. k .. " = " .. v)
+                                        if not cdfPath then cdfPath = v end
+                                    end
+                                end
+                            end
+                        end
+                    end)
+
+                    -- Probe animations on this NPC
+                    local animCandidates = {
+                        "idle", "run", "walk", "sprint", "jog",
+                        "Idle", "Run", "Walk", "Sprint",
+                        "run_loop", "walk_loop", "idle_loop", "sprint_loop",
+                        "run_fwd", "walk_fwd", "run01", "walk01", "idle01",
+                        "mm_run_fwd", "mm_walk_fwd", "mm_idle",
+                        "loco_run", "loco_walk", "loco_idle",
+                        "act_run", "act_walk", "act_idle",
+                    }
+                    for _, aname in ipairs(animCandidates) do
+                        local len = 0
+                        pcall(function() len = ent:GetAnimationLength(0, aname) or 0 end)
+                        if len > 0 then
+                            System.LogAlways(string.format("[KCD2-MP]   ANIM HIT '%s' len=%.3f", aname, len))
+                        end
+                    end
+
+                    -- If we found a CDF, try loading it onto ghost
+                    if cdfPath and cdfPath ~= "" then
+                        System.LogAlways("[KCD2-MP]   Loading CDF onto ghost: " .. cdfPath)
+                        local loadOk, loadErr = pcall(function()
+                            ghost.entity:LoadCharacter(0, cdfPath)
+                        end)
+                        System.LogAlways("[KCD2-MP]   LoadCharacter result: " .. tostring(loadOk) .. " " .. tostring(loadErr))
+
+                        if loadOk then
+                            -- Now probe ghost again
+                            System.LogAlways("[KCD2-MP]   Re-probing ghost after CDF load:")
+                            for _, aname in ipairs(animCandidates) do
+                                local len = 0
+                                pcall(function() len = ghost.entity:GetAnimationLength(0, aname) or 0 end)
+                                if len > 0 then
+                                    System.LogAlways(string.format("[KCD2-MP]   GHOST HIT '%s' len=%.3f", aname, len))
+                                end
+                            end
+                        end
+                    end
+
+                    if humanCount >= 3 then break end
+                end
+            end
+        end
+        System.LogAlways("[KCD2-MP] Found " .. humanCount .. " human NPCs")
+    end)
+    if not ok then
+        System.LogAlways("[KCD2-MP] Error: " .. tostring(err))
+    end
+    System.LogAlways("[KCD2-MP] === END ===")
+end
+
+-- Test AI.SetForcedNavigation on ghost (try to drive locomotion animation via AI)
+function KCD2MP_TestAINav()
+    local ghost = nil
+    for _, g in pairs(KCD2MP.ghosts) do ghost = g; break end
+    if not ghost then
+        System.LogAlways("[KCD2-MP] TestAINav: no ghost")
+        return
+    end
+    local eid = ghost.entityId
+    System.LogAlways("[KCD2-MP] TestAINav: sending velocity {1,0,0} to entityId=" .. tostring(eid))
+
+    -- Try passing velocity vector (tell AI it's moving forward)
+    local ok1, e1 = pcall(function() AI.SetForcedNavigation(eid, {x=3, y=0, z=0}) end)
+    System.LogAlways("[KCD2-MP]   SetForcedNavigation: " .. tostring(ok1) .. " " .. tostring(e1))
+
+    local ok2, e2 = pcall(function() AI.SetSpeed(eid, 3) end)
+    System.LogAlways("[KCD2-MP]   SetSpeed(3): " .. tostring(ok2) .. " " .. tostring(e2))
+
+    local ok3, e3 = pcall(function() AI.Signal(0, 1, "OnMoveForward", eid) end)
+    System.LogAlways("[KCD2-MP]   Signal OnMoveForward: " .. tostring(ok3) .. " " .. tostring(e3))
+end
+
+-- Deep scan: recursively list up to 3 levels, log files with .caf/.adb
+function KCD2MP_ScanAnims()
+    System.LogAlways("[KCD2-MP] === DEEP ANIM SCAN ===")
+
+    local function scanDir(path, depth)
+        local entries = nil
+        pcall(function() entries = System.ScanDirectory(path) end)
+        if not entries then return end
+        for _, name in ipairs(entries) do
+            local full = path .. "/" .. name
+            -- Log CAF/ADB files immediately
+            if name:find("%.caf$") or name:find("%.CAF$") then
+                System.LogAlways("[KCD2-MP] CAF: " .. full)
+            elseif name:find("%.adb$") or name:find("%.ADB$") then
+                System.LogAlways("[KCD2-MP] ADB: " .. full)
+            elseif depth < 3 then
+                -- Recurse into subdirectory
+                scanDir(full, depth + 1)
+            end
+        end
+    end
+
+    -- Scan humans animation tree
+    scanDir("Animations/humans", 1)
+    scanDir("Animations/assets", 1)
+    scanDir("Animations/Mannequin/adb", 1)
+
+    System.LogAlways("[KCD2-MP] === END DEEP SCAN ===")
+end
+
+-- Try AI.SetForcedNavigation to drive locomotion animation
+-- dirX, dirY = movement direction (unit vector), speed = 0 to stop
+function KCD2MP_SetGhostMovement(id, dirX, dirY, speed)
+    local ghost = KCD2MP.ghosts[id]
+    if not ghost or not ghost.entity then return end
+
+    local eid = ghost.entityId
+    if speed > 0 then
+        -- Tell AI the entity is moving in this direction at this speed
+        pcall(function() AI.SetSpeed(eid, speed) end)
+        pcall(function()
+            AI.SetForcedNavigation(eid, {x=dirX, y=dirY, z=0})
+        end)
+    else
+        pcall(function() AI.SetForcedNavigation(eid, {x=0, y=0, z=0}) end)
+        pcall(function() AI.SetSpeed(eid, 0) end)
+    end
+end
+
+-- Read Mannequin ADB via CryEngine XML loader (reads from PAK)
+function KCD2MP_ReadADB()
+    System.LogAlways("[KCD2-MP] === READ ADB ===")
+
+    local adbPaths = {
+        "Animations/Mannequin/ADB/kcd_male_database.adb",
+        "Animations/Mannequin/adb/kcd_male_database.adb",
+        "animations/mannequin/adb/kcd_male_database.adb",
+    }
+
+    -- Try CryEngine XML loader (reads files from PAK virtual filesystem)
+    for _, path in ipairs(adbPaths) do
+        local node = nil
+        local ok, err = pcall(function()
+            node = System.LoadXMLFile(path)
+        end)
+        System.LogAlways("[KCD2-MP] LoadXMLFile(" .. path .. "): ok=" .. tostring(ok) .. " node=" .. tostring(node) .. " err=" .. tostring(err))
+        if ok and node then
+            System.LogAlways("[KCD2-MP] XML loaded! Walking nodes...")
+            -- Walk XML tree looking for Fragment names
+            local function walkNode(n, depth)
+                if depth > 4 then return end
+                local tag = ""
+                local name = ""
+                pcall(function() tag = n:getTag() end)
+                pcall(function() name = n:getAttr("name") end)
+                if name and name ~= "" then
+                    System.LogAlways("[KCD2-MP] " .. string.rep("  ", depth) .. tag .. " name='" .. name .. "'")
+                end
+                local count = 0
+                pcall(function() count = n:getChildCount() end)
+                for i = 0, count - 1 do
+                    local child = nil
+                    pcall(function() child = n:getChild(i) end)
+                    if child then walkNode(child, depth + 1) end
+                end
+            end
+            walkNode(node, 0)
+            System.LogAlways("[KCD2-MP] === END ===")
+            return
+        end
+    end
+
+    -- Fallback: ScanDirectory
+    System.LogAlways("[KCD2-MP] LoadXMLFile failed for all paths. Scanning directories...")
+    local dirs = {
+        "Animations/Mannequin/ADB",
+        "Animations/Mannequin/adb",
+        "Animations/Mannequin/adb/adb",
+    }
+    for _, d in ipairs(dirs) do
+        local entries = nil
+        pcall(function() entries = System.ScanDirectory(d) end)
+        if entries and #entries > 0 then
+            System.LogAlways("[KCD2-MP] " .. d .. " -> " .. #entries .. " entries:")
+            for i, e in ipairs(entries) do
+                System.LogAlways("[KCD2-MP]   " .. e)
+                if i > 30 then break end
+            end
+        else
+            System.LogAlways("[KCD2-MP] " .. d .. " -> empty/nil")
+        end
+    end
+
+    System.LogAlways("[KCD2-MP] === END ===")
+end
+
+-- Probe Mannequin animation tags on ghost via AI.SetAnimationTag
+-- Tags drive which Mannequin fragments play (including locomotion)
+function KCD2MP_ProbeAnimTags()
+    local ghost = nil
+    for _, g in pairs(KCD2MP.ghosts) do ghost = g; break end
+    if not ghost then
+        System.LogAlways("[KCD2-MP] ProbeAnimTags: no ghost")
+        return
+    end
+    local eid = ghost.entityId
+    System.LogAlways("[KCD2-MP] === PROBE ANIM TAGS ===")
+    System.LogAlways("[KCD2-MP] entityId=" .. tostring(eid))
+
+    -- Common Mannequin tag names for locomotion
+    local tags = {
+        "Moving", "moving", "Run", "run", "Walk", "walk",
+        "Sprint", "sprint", "Locomotion", "locomotion",
+        "Alert", "alert", "Relaxed", "relaxed",
+        "InCombat", "Combat", "Idle", "idle",
+        "Forward", "forward", "MoveForward",
+        "Jogging", "Running", "Walking",
+    }
+
+    System.LogAlways("[KCD2-MP] Trying AI.SetAnimationTag:")
+    for _, tag in ipairs(tags) do
+        local ok, err = pcall(function()
+            AI.SetAnimationTag(eid, tag)
+        end)
+        -- Log only errors or interesting results
+        if not ok then
+            System.LogAlways("[KCD2-MP]   tag='" .. tag .. "' ERROR: " .. tostring(err))
+        else
+            System.LogAlways("[KCD2-MP]   tag='" .. tag .. "' OK")
+        end
+    end
+
+    -- Also try clearing tags
+    pcall(function() AI.SetAnimationTag(eid, "") end)
+
+    System.LogAlways("[KCD2-MP] === END ===")
+end
+
+-- Test the real animation names from ADB analysis
+function KCD2MP_TestRunAnim()
+    local ghost = nil
+    for _, g in pairs(KCD2MP.ghosts) do ghost = g; break end
+    if not ghost or not ghost.entity then
+        System.LogAlways("[KCD2-MP] TestRunAnim: no ghost")
+        return
+    end
+    local ent = ghost.entity
+    local eid = ghost.entityId
+    System.LogAlways("[KCD2-MP] === TEST REAL ANIM NAMES ===")
+
+    local names = {
+        "3d_relaxed_run_turn_strafe",
+        "3d_relaxed_walk_turn_strafe",
+        "relaxed_idle_both",
+        "3d_armored_walk_turn_strafe",
+        "3d_wounded_run_turn_strafe",
+    }
+    for _, name in ipairs(names) do
+        local len = 0
+        pcall(function() len = ent:GetAnimationLength(0, name) or 0 end)
+        local started = false
+        pcall(function() started = ent:StartAnimation(0, name) end)
+        System.LogAlways(string.format("[KCD2-MP] '%s': len=%.3f started=%s",
+            name, len, tostring(started)))
+    end
+
+    -- Also try AI tag "run"
+    System.LogAlways("[KCD2-MP] Setting AI tag 'run'...")
+    pcall(function() AI.SetAnimationTag(eid, "run") end)
+    pcall(function() AI.SetSpeed(eid, 4) end)
+
+    System.LogAlways("[KCD2-MP] === END ===")
+end
+
 -- ===== Register Console Commands =====
 
 local ok, err = pcall(function()
@@ -434,6 +859,13 @@ local ok, err = pcall(function()
     System.AddCCommand("mp_remove_all",  "KCD2MP_RemoveAllGhosts()","Remove all ghosts")
     System.AddCCommand("mp_inspect",     "KCD2MP_InspectGhost()",   "Inspect ghost interp state")
     System.AddCCommand("mp_find_npcs",   "KCD2MP_FindNPCs()",       "Find nearby human NPCs")
+    System.AddCCommand("mp_probe_anims",   "KCD2MP_ProbeAnims()",    "Probe anim names on ghost (GetAnimationLength)")
+    System.AddCCommand("mp_copy_npc",     "KCD2MP_CopyNPCModel()",  "Find human NPC, copy CDF to ghost, probe anims")
+    System.AddCCommand("mp_scan_anims",   "KCD2MP_ScanAnims()",     "Scan animation directories")
+    System.AddCCommand("mp_test_ai_nav",  "KCD2MP_TestAINav()",     "Test AI.SetForcedNavigation on ghost")
+    System.AddCCommand("mp_read_adb",     "KCD2MP_ReadADB()",       "Read kcd_male_database.adb via CryEngine XML loader")
+    System.AddCCommand("mp_probe_tags",   "KCD2MP_ProbeAnimTags()", "Probe Mannequin animation tags on ghost")
+    System.AddCCommand("mp_test_run",     "KCD2MP_TestRunAnim()",   "Test 3d_relaxed_run_turn_strafe on ghost")
     System.LogAlways("[KCD2-MP] Commands OK")
 end)
 if not ok then
