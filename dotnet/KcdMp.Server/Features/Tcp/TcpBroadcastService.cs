@@ -1,53 +1,33 @@
-using System.Net;
-using System.Net.Sockets;
+﻿using KcdMp.Server.Features.Client;
+using Microsoft.Extensions.Configuration;
 
-namespace KcdMp.Server;
+namespace KcdMp.Server.Features.Tcp;
 
-public class RelayServer(int port, bool echo = false)
+public class TcpBroadcastService
 {
-    private readonly List<ClientSession> _clients = [];
     private readonly object _lock = new();
-    public bool Echo { get; } = echo;
 
-    public async Task RunAsync()
+    private readonly bool _echo;
+    private readonly ClientHandler _clientHandler;
+    
+    public TcpBroadcastService(IConfiguration configuration, ClientHandler clientHandler)
     {
-        var listener = new TcpListener(IPAddress.Any, port);
-        listener.Start();
-        Console.WriteLine($"Listening on port {port}...");
-        Console.WriteLine("Waiting for clients to connect.");
-        Console.WriteLine();
-
-        while (true)
-        {
-            var tcp = await listener.AcceptTcpClientAsync();
-            var session = new ClientSession(tcp, this);
-
-            lock (_lock)
-                _clients.Add(session);
-
-            _ = session.RunAsync().ContinueWith(_ =>
-            {
-                lock (_lock)
-                    _clients.Remove(session);
-                Console.WriteLine($"[-] {session.Name ?? $"id={session.Id}"} disconnected. Clients: {_clients.Count}");
-                if (session.IsReady)
-                    BroadcastDisconnect(session);
-            });
-        }
+        _echo = configuration.GetValue<bool>("Echo");
+        _clientHandler = clientHandler;
     }
-
-    /// <summary>Broadcasts a position update from <paramref name="source"/> to all other ready clients.
+    
+	/// <summary>Broadcasts a position update from <paramref name="source"/> to all other ready clients.
     /// In echo mode also reflects the position back to the sender as ghost id=0.</summary>
     public void Broadcast(ClientSession source, float x, float y, float z, float rotZ, byte flags)
     {
         List<ClientSession> targets;
         lock (_lock)
-            targets = [.. _clients.Where(c => c != source && c.IsReady)];
+            targets = [.. _clientHandler.GetClients().Where(c => c != source && c.IsReady)];
 
         foreach (var target in targets)
             target.EnqueueGhost(source.Id, x, y, z, rotZ, flags);
 
-        if (Echo)
+        if (_echo)
         {
             // Place echo ghost 1 m to the right of the player's facing direction
             float sideX = (float)Math.Cos(rotZ);
@@ -63,7 +43,7 @@ public class RelayServer(int port, bool echo = false)
 
         List<ClientSession> targets;
         lock (_lock)
-            targets = [.. _clients.Where(c => c != source && c.IsReady)];
+            targets = [.. _clientHandler.GetClients().Where(c => c != source && c.IsReady)];
 
         foreach (var target in targets)
             target.EnqueueName(source.Id, source.Name);
@@ -74,7 +54,7 @@ public class RelayServer(int port, bool echo = false)
     {
         List<ClientSession> targets;
         lock (_lock)
-            targets = [.. _clients.Where(c => c.IsReady)];
+            targets = [.. _clientHandler.GetClients().Where(c => c.IsReady)];
 
         foreach (var target in targets)
             target.EnqueueDisconnect(disconnected.Id);
@@ -85,7 +65,7 @@ public class RelayServer(int port, bool echo = false)
     {
         List<ClientSession> existing;
         lock (_lock)
-            existing = [.. _clients.Where(c => c != newClient && c.IsReady)];
+            existing = [.. _clientHandler.GetClients().Where(c => c != newClient && c.IsReady)];
 
         foreach (var c in existing)
             newClient.EnqueueName(c.Id, c.Name!);

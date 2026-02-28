@@ -1,18 +1,33 @@
-using KcdMp.Server;
+using KcdMp.Server.Features.Client;
+using KcdMp.Server.Features.Tcp;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Serilog;
 
-int port = 7778;
-bool echo = false;
-for (int i = 0; i < args.Length; i++)
+namespace KcdMp.Server;
+
+class Program
 {
-    if (args[i] == "--port" && i + 1 < args.Length)
-        port = int.Parse(args[++i]);
-    if (args[i] == "--echo")
-        echo = true;
+	static async Task Main(string[] args)
+	{
+		var builder = Host.CreateApplicationBuilder(args);
+		
+		// Logging config
+		builder.Services.AddSerilog(options =>
+		{
+			options.ReadFrom.Configuration(builder.Configuration);
+		});
+		
+		// Add TCP Socket as background service
+		builder.Services.AddHostedService<TcpSocketService>();
+		
+		// 
+		builder.Services.AddSingleton<ClientHandler>();
+		builder.Services.AddSingleton<TcpBroadcastService>();
+		
+		using var app = builder.Build();
+		
+		await app.RunAsync();
+	}
 }
-
-Console.WriteLine("=== KCD2 Multiplayer Relay Server ===");
-Console.WriteLine($"Port: {port}  Echo: {echo}");
-Console.WriteLine();
-
-var server = new RelayServer(port, echo);
-await server.RunAsync();

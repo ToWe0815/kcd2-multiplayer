@@ -2,8 +2,9 @@ using System.Buffers.Binary;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
+using KcdMp.Server.Features.Tcp;
 
-namespace KcdMp.Server;
+namespace KcdMp.Server.Features.Client;
 
 /// <summary>
 /// Handles one connected client agent.
@@ -27,18 +28,18 @@ public class ClientSession
 
     private readonly TcpClient _tcp;
     private readonly NetworkStream _stream;
-    private readonly RelayServer _server;
+    private readonly TcpBroadcastService _broadcastService;
     private readonly Channel<byte[]> _writeQueue = Channel.CreateUnbounded<byte[]>();
 
     public byte Id { get; } = (byte)Interlocked.Increment(ref _idCounter);
     public string? Name { get; private set; }
     public bool IsReady => Name is not null;
 
-    public ClientSession(TcpClient tcp, RelayServer server)
+    public ClientSession(TcpClient tcp, TcpBroadcastService broadcastService)
     {
         _tcp = tcp;
         _stream = tcp.GetStream();
-        _server = server;
+        _broadcastService = broadcastService;
     }
 
     public async Task RunAsync()
@@ -67,8 +68,8 @@ public class ClientSession
             EnqueueRaw(BuildPacket(0xFF, [Id]));
 
             // Broadcast this client's name to all others; send existing names to this client
-            _server.BroadcastName(this);
-            _server.SendAllNamesTo(this);
+            _broadcastService.BroadcastName(this);
+            _broadcastService.SendAllNamesTo(this);
 
             // --- Position receive loop ---
             // Accepts both v1 (16 bytes: x,y,z,rotZ) and v2 (17 bytes: x,y,z,rotZ,flags)
@@ -108,7 +109,7 @@ public class ClientSession
                 float rotZ = ReadFloat(posPayload, 12);
                 byte  flags = payloadLen >= 17 ? posPayload[16] : (byte)0x00;
 
-                _server.Broadcast(this, x, y, z, rotZ, flags);
+                _broadcastService.Broadcast(this, x, y, z, rotZ, flags);
             }
         }
         catch (Exception ex) when (ex is IOException or SocketException or EndOfStreamException)
